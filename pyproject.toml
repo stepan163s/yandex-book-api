@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "yandex-book-api"
+version = "2.0.0"
+description = "Python-клиент для Bookmate / Яндекс Книги API"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "stepan163s", email = "stepan163s@yandex.ru" }
+]
+requires-python = ">=3.9"
+dependencies = [
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+async = [
+    "aiohttp>=3.9",
+    "aiofiles>=23.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "pytest-asyncio>=0.23",
+    "typing_extensions>=4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/stepan163s/yandex-book-api"
+Repository = "https://github.com/stepan163s/yandex-book-api"
+
+[tool.setuptools.packages.find]
+include = ["yandex_book*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+
+[tool.coverage.run]
+source = ["yandex_book"]
+omit = ["yandex_book/client_async.py", "tests/*"]

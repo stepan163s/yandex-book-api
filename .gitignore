@@ -40,3 +40,11 @@ Thumbs.db
 downloads/
 avatars/
 covers/
+
+# Secrets / tokens
+token.txt
+*.token
+.env
+.env.*
+*.secret
+secrets/
