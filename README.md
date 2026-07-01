@@ -81,6 +81,20 @@ client.add_book("mqK3FFjg")
 
 ## Установка
 
+Установите библиотеку через pip:
+
+```bash
+pip install yandex-book-api
+```
+
+Если вы хотите использовать асинхронный клиент (на базе `aiohttp`), установите его с дополнительными зависимостями:
+
+```bash
+pip install yandex-book-api[async]
+```
+
+Для локальной разработки (в режиме редактирования):
+
 ```bash
 pip install -e .
 ```
