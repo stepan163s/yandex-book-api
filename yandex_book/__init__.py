@@ -8,19 +8,21 @@ yandex_book — Python-клиент для Bookmate / Яндекс Книги AP
     me = client.get_profile()
     print(me.name, me.login)
 
-    books = client.get_user_books(me.uuid)
+    books = client.get_user_books(me.login)
     for book in books:
         print(book.display_title)
 """
 
-__version__ = '2.0.0'
+from yandex_book._version import __version__
 __author__ = 'stepan163s'
 
 from yandex_book.client import YandexBookClient
 
 try:
     from yandex_book.client_async import YandexBookClientAsync
-except ImportError:
+except ModuleNotFoundError as exc:
+    if exc.name not in ('aiohttp', 'aiofiles'):
+        raise
     # aiohttp не установлен — async-клиент недоступен
     YandexBookClientAsync = None  # type: ignore[assignment,misc]
 
@@ -31,6 +33,7 @@ from yandex_book.bookshelf.bookshelf import Bookshelf
 from yandex_book.exceptions import (
     ApiError,
     BadRequestError,
+    EndpointGoneError,
     IdMissingError,
     InvalidOptionError,
     NetworkError,
@@ -53,6 +56,7 @@ __all__ = [
     'TimedOutError',
     'UnauthorizedError',
     'BadRequestError',
+    'EndpointGoneError',
     'NotFoundError',
     'InvalidOptionError',
     'IdMissingError',

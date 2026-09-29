@@ -9,7 +9,7 @@ Async-версия генерируется скриптом generate_async_vers
 
     client = YandexBookClient('y0_AgAAAA...')
     me = client.get_profile()
-    books = client.get_user_books(me.uuid)
+    books = client.get_user_books(me.login)
 
 Методы сгруппированы по доменам:
   • Профиль / аутентификация
@@ -27,15 +27,36 @@ from __future__ import annotations
 import functools
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from yandex_book.utils.request import Request
+
+from yandex_book.achievement.achievement import ReadingAchievement
+from yandex_book.book.book import Audiobook, Book, Comicbook, LibraryCard
+from yandex_book.bookshelf.bookshelf import Bookshelf
+from yandex_book.impression.impression import Impression
+from yandex_book.quote.quote import Quote
+from yandex_book.user.user import User
+from yandex_book.exceptions import EndpointGoneError, IdMissingError, InvalidOptionError, UnauthorizedError
 
 logger = logging.getLogger(__name__)
 
 # URL-константы
 _REST_BASE = 'https://api.bookmate.yandex.net/api/v5'
 _GRAPHQL_URL = 'https://api-gateway.bookmate.yandex.net/graphql'
+
+
+def _legacy_url(base_url: str, path: str) -> str:
+    parsed = urlsplit(base_url)
+    return urlunsplit((parsed.scheme, parsed.netloc, f'/a/4/{path}', '', ''))
+
+
+def _validate_pagination(page: int, per_page: int) -> None:
+    if type(page) is not int or page < 1:
+        raise InvalidOptionError('page должен быть целым числом больше нуля')
+    if type(per_page) is not int or not 1 <= per_page <= 100:
+        raise InvalidOptionError('per_page должен быть целым числом от 1 до 100')
 
 # GraphQL-запросы (вынесены в константы для читаемости)
 _GQL_SEARCH = """
@@ -136,7 +157,6 @@ def log(method):
     def wrapper(*args, **kwargs):
         method_logger.debug('Entering: %s', method.__name__)
         result = method(*args, **kwargs)
-        method_logger.debug(result)
         method_logger.debug('Exiting: %s', method.__name__)
         return result
 
@@ -182,32 +202,64 @@ class YandexBookClient:
             self._request.set_language(language)
 
         # Заполняется после вызова init()
-        self.me: Optional[Any] = None
+        self.me: Optional[User] = None
         self.account_uuid: Optional[str] = None
+        self.account_login: Optional[str] = None
+
+    def close(self) -> None:
+        self._request.close()
+
+    def __enter__(self) -> 'YandexBookClient':
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
 
     def init(self) -> 'YandexBookClient':
         """Загрузить данные авторизованного пользователя.
 
-        Вызывается один раз после создания клиента, если нужен account_uuid
-        для методов, принимающих user_id=None.
+        Заполняет me и account_login. Для запросов пользователя нужен логин;
+        account_uuid сохранён для совместимости и не используется в маршрутах.
         """
         self.me = self.get_profile()
         if self.me:
             self.account_uuid = self.me.uuid or str(self.me.id or '')
+            self.account_login = self.me.login
         return self
+
+    def _resolve_user_login(self, user_id: Optional[Union[int, str]]) -> str:
+        if isinstance(user_id, str):
+            if not user_id.strip():
+                raise IdMissingError('Логин пользователя отсутствует')
+            return user_id.strip()
+        if user_id is not None and type(user_id) is not int:
+            raise InvalidOptionError('Нужен логин пользователя')
+        if user_id is not None and not self.token:
+            raise InvalidOptionError('Числовой ID поддерживается только для текущего аккаунта с токеном; передайте логин')
+        profile = self.me or self.get_profile()
+        if profile is None or not profile.login:
+            raise IdMissingError('Логин текущего пользователя отсутствует в профиле')
+        if user_id is not None and profile.id != user_id:
+            raise InvalidOptionError('Для другого пользователя нужен логин, а не числовой ID')
+        self.me = profile
+        self.account_login = profile.login
+        return profile.login
+
+    def _user_url(self, user_id: Optional[Union[int, str]], suffix: str = '') -> str:
+        login = self._resolve_user_login(user_id)
+        return f'{self.base_url}/users/{quote(login, safe="")}{suffix}'
 
     # ================================================================== #
     # ПРОФИЛЬ И АВТОРИЗАЦИЯ                                               #
     # ================================================================== #
 
     @log
-    def get_profile(self):
+    def get_profile(self) -> Optional[User]:
         """Получить профиль авторизованного пользователя.
 
         Returns:
             User — объект текущего пользователя.
         """
-        from yandex_book.user.user import User
         url = f'{self.base_url}/profile'
         result = self._request.get(url)
         return User.de_json(result.get('user'), self)
@@ -257,13 +309,13 @@ class YandexBookClient:
     @log
     def get_user_json(self) -> Dict[str, Any]:
         """Полный JSON объект текущего пользователя."""
-        url = f'{self.base_url}/a/4/user.json'
+        url = _legacy_url(self.base_url, 'user.json')
         return self._request.get(url)
 
     @log
     def get_push_notification_restrictions(self) -> Dict[str, Any]:
         """Ограничения для push-уведомлений."""
-        url = f'{self.base_url}/a/4/push_notification_settings/restrictions'
+        url = _legacy_url(self.base_url, 'push_notification_settings/restrictions')
         return self._request.get(url)
 
     @log
@@ -280,91 +332,85 @@ class YandexBookClient:
                 'year_paywall_v2', 'sync_progress_v2', 'person_subscription',
                 'show_paywall_on_every_launch', 'plus_benefits_from_offer',
             ]
-        params = '&'.join(f'names[]={n}' for n in feature_names)
-        url = f'{self.base_url}/features?{params}'
-        return self._request.get(url)
+        url = f'{self.base_url}/features'
+        return self._request.get(url, params={'names[]': feature_names})
 
     # ================================================================== #
     # ПОЛЬЗОВАТЕЛИ (ПУБЛИЧНЫЕ ДАННЫЕ)                                     #
     # ================================================================== #
 
     @log
-    def get_user(self, user_id):
+    def get_user(self, user_id: Union[int, str]) -> Optional[User]:
         """Получить публичный профиль пользователя.
 
         Args:
-            user_id: числовой ID или строковый UUID пользователя.
+            user_id: логин. Числовой ID текущего аккаунта разрешается через профиль
+                     при наличии токена. Для других пользователей нужен логин.
 
         Returns:
             User или None.
         """
-        from yandex_book.user.user import User
-        url = f'{self.base_url}/users/{user_id}'
+        url = self._user_url(user_id)
         result = self._request.get(url)
         return User.de_json(result.get('user'), self)
 
     @log
-    def get_user_books(self, user_id) -> List[Any]:
+    def get_user_books(self, user_id: Union[int, str]) -> List[Book]:
         """Книги пользователя."""
-        from yandex_book.book.book import Book
-        url = f'{self.base_url}/users/{user_id}/books'
+        url = self._user_url(user_id, '/books')
         result = self._request.get(url)
         return Book.de_list(result.get('books', []), self)
 
     @log
-    def get_user_audiobooks(self, user_id) -> List[Any]:
+    def get_user_audiobooks(self, user_id: Union[int, str]) -> List[Audiobook]:
         """Аудиокниги пользователя."""
-        from yandex_book.book.book import Audiobook
-        url = f'{self.base_url}/users/{user_id}/audiobooks'
+        url = self._user_url(user_id, '/audiobooks')
         result = self._request.get(url)
         return Audiobook.de_list(result.get('audiobooks', []), self)
 
     @log
-    def get_user_comics(self, user_id) -> List[Any]:
+    def get_user_comics(self, user_id: Union[int, str]) -> List[Comicbook]:
         """Комиксы пользователя."""
-        from yandex_book.book.book import Comicbook
-        url = f'{self.base_url}/users/{user_id}/comicbooks'
+        url = self._user_url(user_id, '/comicbooks')
         result = self._request.get(url)
         return Comicbook.de_list(result.get('comicbooks', []), self)
 
     @log
-    def get_user_bookshelves(self, user_id) -> List[Any]:
+    def get_user_bookshelves(self, user_id: Union[int, str]) -> List[Bookshelf]:
         """Полки пользователя."""
-        from yandex_book.bookshelf.bookshelf import Bookshelf
-        url = f'{self.base_url}/users/{user_id}/bookshelves'
+        url = self._user_url(user_id, '/bookshelves')
         result = self._request.get(url)
         return Bookshelf.de_list(result.get('bookshelves', []), self)
 
     @log
-    def get_user_followings(self, user_id) -> List[Any]:
+    def get_user_followings(self, user_id: Union[int, str]) -> List[User]:
         """Подписки пользователя (на других пользователей)."""
-        from yandex_book.user.user import User
-        url = f'{self.base_url}/users/{user_id}/followings'
+        url = self._user_url(user_id, '/followings')
         result = self._request.get(url)
         return User.de_list(result.get('users', []), self)
 
     @log
-    def get_user_impressions(self, user_id) -> List[Any]:
+    def get_user_impressions(self, user_id: Union[int, str]) -> List[Impression]:
         """Рецензии пользователя."""
-        from yandex_book.impression.impression import Impression
-        url = f'{self.base_url}/users/{user_id}/impressions'
+        url = self._user_url(user_id, '/impressions')
         result = self._request.get(url)
         return Impression.de_list(result.get('impressions', []), self)
 
     @log
-    def get_user_quotes(self, user_id) -> List[Any]:
+    def get_user_quotes(self, user_id: Union[int, str]) -> List[Quote]:
         """Цитаты пользователя."""
-        from yandex_book.quote.quote import Quote
-        url = f'{self.base_url}/users/{user_id}/quotes'
+        url = self._user_url(user_id, '/quotes')
         result = self._request.get(url)
         return Quote.de_list(result.get('quotes', []), self)
 
     @log
-    def get_user_reading_achievements(self, user_id) -> List[Any]:
-        """Достижения чтения пользователя."""
-        from yandex_book.achievement.achievement import ReadingAchievement
-        url = f'{self.base_url}/users/{user_id}/reading_achievements'
-        result = self._request.get(url)
+    def get_user_reading_achievements(self, user_id: Union[int, str]) -> List[ReadingAchievement]:
+        """Устаревший эндпоинт достижений: сервис возвращает HTTP 410."""
+        url = self._user_url(user_id, '/reading_achievements')
+        try:
+            result = self._request.get(url)
+        except EndpointGoneError as exc:
+            raise EndpointGoneError('Достижения чтения больше недоступны. get_reading_statistics() возвращает текущую статистику вашего аккаунта, но не заменяет годовые достижения другого пользователя.') from exc
         return ReadingAchievement.de_list(result.get('reading_achievements', []), self)
 
     # ================================================================== #
@@ -372,45 +418,59 @@ class YandexBookClient:
     # ================================================================== #
 
     @log
-    def get_book(self, book_id: str):
+    def get_person_books(self, person_id: str, role: str = 'author', page: int = 1, per_page: int = 20) -> List[Book]:
+        if not person_id or not person_id.strip():
+            raise IdMissingError('UUID автора отсутствует')
+        if role not in ('author', 'translator', 'narrator', 'illustrator', 'publisher'):
+            raise InvalidOptionError('Неизвестная роль участника книги')
+        if page < 1 or per_page < 1:
+            raise InvalidOptionError('page и per_page должны быть больше нуля')
+        url = f'{self.base_url}/authors/{person_id}/books'
+        result = self._request.get(url, params={'role': role, 'page': page, 'per_page': per_page})
+        return Book.de_list(result.get('books', []), self)
+
+    @log
+    def get_book(self, book_id: str) -> Optional[Book]:
         """Получить книгу по UUID.
 
         Returns:
             Book или None.
         """
-        from yandex_book.book.book import Book
         url = f'{self.base_url}/books/{book_id}'
         result = self._request.get(url)
         return Book.de_json(result.get('book'), self)
 
     @log
-    def get_book_impressions(self, book_id: str) -> List[Any]:
+    def get_book_impressions(self, book_id: str) -> List[Impression]:
         """Рецензии на книгу."""
-        from yandex_book.impression.impression import Impression
         url = f'{self.base_url}/books/{book_id}/impressions'
         result = self._request.get(url)
         return Impression.de_list(result.get('impressions', []), self)
 
     @log
-    def get_audiobook(self, audiobook_id: str):
+    def get_audiobook(self, audiobook_id: str) -> Optional[Audiobook]:
         """Получить аудиокнигу по UUID."""
-        from yandex_book.book.book import Audiobook
         url = f'{self.base_url}/audiobooks/{audiobook_id}'
         result = self._request.get(url)
         return Audiobook.de_json(result.get('audiobook'), self)
 
     @log
-    def get_comicbook(self, comic_id: str):
+    def get_audiobook_impressions(self, audiobook_id: str) -> List[Impression]:
+        """Рецензии на аудиокнигу."""
+        url = f'{self.base_url}/audiobooks/{audiobook_id}/impressions'
+        result = self._request.get(url)
+        return Impression.de_list(result.get('impressions', []), self)
+
+    @log
+    def get_comicbook(self, comic_id: str) -> Optional[Comicbook]:
         """Получить комикс по UUID."""
-        from yandex_book.book.book import Comicbook
         url = f'{self.base_url}/comicbooks/{comic_id}'
         result = self._request.get(url)
         return Comicbook.de_json(result.get('comicbook'), self)
 
     @log
-    def get_comicbook_impressions(self, comic_id: str) -> List[Any]:
+    def get_comicbook_impressions(self, comic_id: str) -> List[Impression]:
         """Рецензии на комикс."""
-        from yandex_book.impression.impression import Impression
         url = f'{self.base_url}/comicbooks/{comic_id}/impressions'
         result = self._request.get(url)
         return Impression.de_list(result.get('impressions', []), self)
@@ -420,23 +480,45 @@ class YandexBookClient:
     # ================================================================== #
 
     @log
-    def get_my_library(self, limit: int = 50, offset: int = 0) -> List[Any]:
+    def get_my_library(self, limit: Optional[int] = None, offset: Optional[int] = None,
+                       *, page: Optional[int] = None, per_page: Optional[int] = None) -> List[LibraryCard]:
         """Книги в личной библиотеке.
 
         Args:
-            limit:  количество книг (макс. 100).
-            offset: смещение для пагинации.
+            page: номер страницы, по умолчанию 1.
+            per_page: размер страницы от 1 до 100, по умолчанию 20.
+            limit: прежнее ограничение количества (1–100), вместо page/per_page.
+            offset: прежнее смещение; при отсутствии limit используется 50.
 
         Returns:
             Список LibraryCard.
         """
-        from yandex_book.book.book import LibraryCard
         url = f'{self.base_url}/profile/library_cards'
-        result = self._request.get(url, params={'limit': limit, 'offset': offset})
-        return LibraryCard.de_list(result.get('library_cards', []), self)
+        legacy = limit is not None or offset is not None
+        if legacy and (page is not None or per_page is not None):
+            raise InvalidOptionError('Используйте либо page/per_page, либо limit/offset')
+        if not legacy:
+            page = 1 if page is None else page
+            per_page = 20 if per_page is None else per_page
+            _validate_pagination(page, per_page)
+            result = self._request.get(url, params={'page': page, 'per_page': per_page})
+            return LibraryCard.de_list(result.get('library_cards', []), self)
+        limit = 50 if limit is None else limit
+        offset = 0 if offset is None else offset
+        _validate_pagination(1, limit)
+        if type(offset) is not int or offset < 0:
+            raise InvalidOptionError('offset должен быть целым числом не меньше нуля')
+        page, skip = divmod(offset, limit)
+        page += 1
+        result = self._request.get(url, params={'page': page, 'per_page': limit})
+        items = result.get('library_cards', [])
+        if skip and len(items) == limit:
+            following = self._request.get(url, params={'page': page + 1, 'per_page': limit})
+            items = items + following.get('library_cards', [])
+        return LibraryCard.de_list(items[skip:skip + limit], self)
 
     @log
-    def add_book(self, book_uuid: str):
+    def add_book(self, book_uuid: str) -> Optional[LibraryCard]:
         """Добавить книгу в личную библиотеку.
 
         Args:
@@ -445,7 +527,6 @@ class YandexBookClient:
         Returns:
             LibraryCard или None.
         """
-        from yandex_book.book.book import LibraryCard
         url = f'{self.base_url}/profile/library_cards'
         result = self._request.post(url, data={'book_uuid': book_uuid})
         return LibraryCard.de_json(result.get('library_card'), self)
@@ -469,25 +550,23 @@ class YandexBookClient:
     # ================================================================== #
 
     @log
-    def get_my_bookshelves(self, page: int = 1, per_page: int = 20) -> List[Any]:
+    def get_my_bookshelves(self, page: int = 1, per_page: int = 20) -> List[Bookshelf]:
         """Мои книжные полки.
 
         Returns:
             Список Bookshelf.
         """
-        from yandex_book.bookshelf.bookshelf import Bookshelf
         url = f'{self.base_url}/profile/bookshelves'
         result = self._request.get(url, params={'page': page, 'per_page': per_page})
         return Bookshelf.de_list(result.get('bookshelves', []), self)
 
     @log
-    def get_bookshelf_books(self, bookshelf_uuid: str) -> List[Any]:
+    def get_bookshelf_books(self, bookshelf_uuid: str) -> List[Book]:
         """Книги на полке.
 
         Returns:
             Список Book.
         """
-        from yandex_book.book.book import Book
         url = f'{self.base_url}/bookshelves/{bookshelf_uuid}/books'
         result = self._request.get(url)
         return Book.de_list(result.get('books', []), self)
@@ -499,21 +578,19 @@ class YandexBookClient:
     @log
     def get_series_following(
         self,
-        user_id=None,
+        user_id: Optional[Union[int, str]] = None,
         page: int = 1,
         per_page: int = 20,
     ) -> Dict[str, Any]:
         """Серии, на которые подписан пользователь.
 
         Args:
-            user_id:  ID пользователя. Если None — используется профиль.
+            user_id: логин пользователя. Если None — логин из своего профиля.
             page:     номер страницы.
             per_page: элементов на странице.
         """
-        if user_id is None:
-            url = f'{self.base_url}/profile/series/following'
-        else:
-            url = f'{self.base_url}/users/{user_id}/series/following'
+        _validate_pagination(page, per_page)
+        url = self._user_url(user_id, '/series/following')
         return self._request.get(url, params={'page': page, 'per_page': per_page})
 
     # ================================================================== #
@@ -521,8 +598,8 @@ class YandexBookClient:
     # ================================================================== #
 
     @log
-    def get_reading_achievements(self, year: Optional[int] = None):
-        """Достижения чтения авторизованного пользователя.
+    def get_reading_achievements(self, year: Optional[int] = None) -> Optional[ReadingAchievement]:
+        """Устаревший эндпоинт достижений: сервис возвращает HTTP 410.
 
         Args:
             year: год (если None — текущий год).
@@ -530,18 +607,20 @@ class YandexBookClient:
         Returns:
             ReadingAchievement или None.
         """
-        from yandex_book.achievement.achievement import ReadingAchievement
         if year:
             url = f'{self.base_url}/profile/reading_achievements/{year}'
         else:
             url = f'{self.base_url}/profile/reading_achievements'
-        result = self._request.get(url)
+        try:
+            result = self._request.get(url)
+        except EndpointGoneError as exc:
+            raise EndpointGoneError('Годовые достижения чтения больше недоступны. Используйте get_reading_statistics() для текущей статистики; её формат и набор показателей отличаются.') from exc
         return ReadingAchievement.de_json(result.get('reading_achievement') or result.get('data'), self)
 
     @log
     def get_emotions(self) -> Dict[str, Any]:
         """Доступные эмоции для рецензий."""
-        url = f'{self.base_url}/a/4/d/impressions/emotions'
+        url = _legacy_url(self.base_url, 'd/impressions/emotions')
         return self._request.get(url)
 
     # ================================================================== #
@@ -576,12 +655,14 @@ class YandexBookClient:
         Args:
             query:       поисковый запрос (например, 'Мастер и Маргарита').
             no_misspell: не предлагать исправление опечаток.
-            types:       фильтр по типам (TextBook, AudioBook, Person…).
-                         Пустой список = все типы.
+            types:       значения enum Type из схемы GraphQL сервиса.
+                         Пустой список = все типы. Имена __typename
+                         в ответах не являются значениями этого enum.
             cursor:      курсор пагинации (пусто = первая страница).
 
         Returns:
-            Сырой dict с ключом data.search.page.
+            Нормализованный dict с data.search.page при успешном ответе.
+            Ошибки GraphQL возвращаются в errors, включая HTTP 200.
         """
         variables = {
             'query': {
@@ -646,7 +727,7 @@ class YandexBookClient:
         try:
             result = self.get_profile()
             return result is not None
-        except Exception:
+        except UnauthorizedError:
             return False
 
     def download_file(self, url: str, filepath: str) -> None:

@@ -12,7 +12,8 @@ from yandex_book.client import YandexBookClient
 @pytest.fixture(scope='session')
 def client():
     """Клиент без токена — только для тестирования моделей."""
-    return YandexBookClient()
+    with YandexBookClient() as instance:
+        yield instance
 
 
 # ---------------------------------------------------------------------------

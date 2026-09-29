@@ -54,9 +54,11 @@ class Bookshelf(BaseModel):
 
     def fetch_books(self):
         """Получить книги на полке."""
-        assert self.valid_client(self.client), 'Требуется синхронный клиент'
+        self.require_client()
+        self.require_id(self.uuid)
         return self.client.get_bookshelf_books(self.uuid)  # type: ignore[union-attr]
 
     async def fetch_books_async(self):
-        assert self.valid_async_client(self.client), 'Требуется асинхронный клиент'
+        self.require_client(asynchronous=True)
+        self.require_id(self.uuid)
         return await self.client.get_bookshelf_books(self.uuid)  # type: ignore[union-attr]

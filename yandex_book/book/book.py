@@ -20,6 +20,7 @@ from dataclasses import field
 from typing import TYPE_CHECKING, Any, List, Optional
 
 from yandex_book.base import BaseModel
+from yandex_book.exceptions import InvalidOptionError
 from yandex_book.utils import model
 
 if TYPE_CHECKING:
@@ -72,6 +73,7 @@ class Book(BaseModel):
     background_color_hex: Optional[str] = None
 
     cover: Optional['Image'] = None
+    authors_text: Optional[str] = None
     authors: Optional[List['Person']] = field(default_factory=list)
     authors_objects: Optional[List['Person']] = field(default_factory=list)
     translators: Optional[List['Person']] = field(default_factory=list)
@@ -100,8 +102,22 @@ class Book(BaseModel):
         """
         from yandex_book.user.user import Image, Person
         cls_data['cover'] = Image.de_json(data.get('cover'), client)
-        cls_data['authors'] = Person.de_list(data.get('authors', []), client)
         cls_data['authors_objects'] = Person.de_list(data.get('authors_objects', []), client)
+        authors = data.get('authors')
+        if isinstance(authors, str):
+            cls_data['authors_text'] = authors
+            cls_data['authors'] = list(cls_data['authors_objects'])
+        elif isinstance(authors, list):
+            parsed_authors = []
+            for author in authors:
+                if isinstance(author, str):
+                    author = {'name': author} if author.strip() else None
+                person = Person.de_json(author, client)
+                if person is not None:
+                    parsed_authors.append(person)
+            cls_data['authors'] = parsed_authors or list(cls_data['authors_objects'])
+        else:
+            cls_data['authors'] = list(cls_data['authors_objects'])
         cls_data['translators'] = Person.de_list(data.get('translators', []), client)
         cls_data['labels'] = Label.de_list(data.get('labels', []), client)
 
@@ -123,20 +139,29 @@ class Book(BaseModel):
 
     def fetch_impressions(self):
         """Получить рецензии на книгу."""
-        assert self.valid_client(self.client), 'Требуется синхронный клиент'
+        self.require_client()
+        self.require_id(self.uuid)
         return self.client.get_book_impressions(self.uuid)  # type: ignore[union-attr]
 
     def download_cover(self, size: str = 'large', dest: Optional[str] = None) -> str:
         """Скачать обложку книги."""
-        assert self.valid_client(self.client), 'Требуется синхронный клиент'
-        assert self.cover is not None, 'Обложка недоступна'
+        self.require_client()
+        if not (self.cover is not None):
+            raise InvalidOptionError('Обложка недоступна')
+        if size not in ('small', 'large'):
+            raise InvalidOptionError('Размер обложки должен быть small или large')
         url = getattr(self.cover, size, None) or self.cover.best_url
-        assert url, f'URL обложки размера {size!r} не найден'
+        if not (url):
+            raise InvalidOptionError(f'URL обложки размера {size!r} не найден')
+        if not dest:
+            self.require_id(self.uuid)
         dest = dest or f'covers/books/{self.uuid}_{size}.jpg'
-        return self.client._request.download(url, dest)  # type: ignore[union-attr]
+        self.client.download_file(url, dest)
+        return dest  # type: ignore[union-attr]
 
     async def fetch_impressions_async(self):
-        assert self.valid_async_client(self.client), 'Требуется асинхронный клиент'
+        self.require_client(asynchronous=True)
+        self.require_id(self.uuid)
         return await self.client.get_book_impressions(self.uuid)  # type: ignore[union-attr]
 
 
@@ -159,6 +184,16 @@ class Audiobook(Book):
 
     def __post_init__(self) -> None:
         self._id_attrs = (self.uuid,)
+
+    def fetch_impressions(self):
+        self.require_client()
+        self.require_id(self.uuid)
+        return self.client.get_audiobook_impressions(self.uuid)
+
+    async def fetch_impressions_async(self):
+        self.require_client(asynchronous=True)
+        self.require_id(self.uuid)
+        return await self.client.get_audiobook_impressions(self.uuid)
 
     @classmethod
     def _resolve_nested(cls, data: Any, client: Any, cls_data: dict) -> None:
@@ -184,13 +219,30 @@ class Comicbook(Audiobook):
     def __post_init__(self) -> None:
         self._id_attrs = (self.uuid,)
 
+    def fetch_impressions(self):
+        self.require_client()
+        self.require_id(self.uuid)
+        return self.client.get_comicbook_impressions(self.uuid)
+
+    async def fetch_impressions_async(self):
+        self.require_client(asynchronous=True)
+        self.require_id(self.uuid)
+        return await self.client.get_comicbook_impressions(self.uuid)
+
     def download_cover(self, size: str = 'large', dest: Optional[str] = None) -> str:
-        assert self.valid_client(self.client), 'Требуется синхронный клиент'
-        assert self.cover is not None, 'Обложка недоступна'
+        self.require_client()
+        if not (self.cover is not None):
+            raise InvalidOptionError('Обложка недоступна')
+        if size not in ('small', 'large'):
+            raise InvalidOptionError('Размер обложки должен быть small или large')
         url = getattr(self.cover, size, None) or self.cover.best_url
-        assert url, f'URL обложки размера {size!r} не найден'
+        if not (url):
+            raise InvalidOptionError(f'URL обложки размера {size!r} не найден')
+        if not dest:
+            self.require_id(self.uuid)
         dest = dest or f'covers/comics/{self.uuid}_{size}.jpg'
-        return self.client._request.download(url, dest)  # type: ignore[union-attr]
+        self.client.download_file(url, dest)
+        return dest  # type: ignore[union-attr]
 
 
 # ---------------------------------------------------------------------------
@@ -228,12 +280,13 @@ class LibraryCard(BaseModel):
 
     def remove(self) -> bool:
         """Удалить из библиотеки через клиент."""
-        assert self.valid_client(self.client), 'Требуется синхронный клиент'
-        assert self.uuid, 'UUID карточки отсутствует'
+        self.require_client()
+        self.require_id(self.uuid)
         return self.client.remove_book(self.uuid)  # type: ignore[union-attr]
 
     async def remove_async(self) -> bool:
-        assert self.valid_async_client(self.client), 'Требуется асинхронный клиент'
+        self.require_client(asynchronous=True)
+        self.require_id(self.uuid)
         return await self.client.remove_book(self.uuid)  # type: ignore[union-attr]
 
 

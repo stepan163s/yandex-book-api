@@ -1,130 +1,100 @@
-"""
-generate_async_version.py — генератор асинхронной версии клиента.
-
-Запуск:
-    python generate_async_version.py
-
-Генерирует:
-    yandex_book/client_async.py  — async-версия YandexBookClient
-    (request_async.py написан вручную — содержит aiohttp-специфику)
-
-Принцип: простые замены строк в исходнике client.py.
-Никакого дублирования вручную.
-"""
-import re
-import sys
+import ast
 from pathlib import Path
 
 ROOT = Path(__file__).parent
 CLIENT_SRC = ROOT / 'yandex_book' / 'client.py'
 CLIENT_DST = ROOT / 'yandex_book' / 'client_async.py'
-
-# ---------------------------------------------------------------------------
-# Таблица замен: (old, new, is_regex)
-#   is_regex=True  → re.sub(old, new, source, MULTILINE)
-#   is_regex=False → source.replace(old, new)
-#
-# ВАЖНО: порядок имеет значение.
-# Более специфичные паттерны должны идти ПЕРЕД общими.
-# ---------------------------------------------------------------------------
-
-REPLACEMENTS_CLIENT = [
-    # ---- Класс и импорт -----------------------------------------------
-    ('class YandexBookClient:', 'class YandexBookClientAsync:', False),
-
-    # Docstring класса: синхронный → асинхронный
-    ('Синхронный клиент для Bookmate', 'Асинхронный клиент для Bookmate', False),
-
-    (
-        'from yandex_book.utils.request import Request',
-        'from yandex_book.utils.request_async import RequestAsync as Request',
-        False,
-    ),
-
-    ('_is_async: bool = False', '_is_async: bool = True', False),
-
-    # ---- Публичные методы → async def --------------------------------
-    # Паттерн: ровно 4 пробела + def + имя (не dunder).
-    # Работает и для однострочных сигнатур def f(self, ...) и
-    # для многострочных def f(\n    self,\n    ...).
-    (r'^    def (?!__)([\w]+)\(', r'    async def \1(', True),
-
-    # ---- Декоратор log: wrapper и вызов метода -----------------------
-    ('    def wrapper(*args, **kwargs):', '    async def wrapper(*args, **kwargs):', False),
-    ('        result = method(*args, **kwargs)', '        result = await method(*args, **kwargs)', False),
-
-    # ---- result = self._request.X( -----------------------------------
-    # (специфичные — до общих return/bare вариантов)
-    ('result = self._request.get(', 'result = await self._request.get(', False),
-    ('result = self._request.post(', 'result = await self._request.post(', False),
-    ('result = self._request.delete(', 'result = await self._request.delete(', False),
-    ('result = self._request.graphql(', 'result = await self._request.graphql(', False),
-
-    # ---- return self._request.X( -------------------------------------
-    # Методы, которые возвращают результат запроса напрямую без result=
-    ('return self._request.get(', 'return await self._request.get(', False),
-    ('return self._request.post(', 'return await self._request.post(', False),
-    ('return self._request.graphql(', 'return await self._request.graphql(', False),
-
-    # ---- Голые вызовы без return и без result= -----------------------
-    # remove_book: self._request.delete(url)
-    ('        self._request.delete(url)', '        await self._request.delete(url)', False),
-    # download_file: self._request.download(url, filepath)
-    ('        self._request.download(url, filepath)', '        await self._request.download(url, filepath)', False),
-
-    # ---- Вызовы других async-методов внутри клиента -----------------
-    ('self.me = self.get_profile()', 'self.me = await self.get_profile()', False),
-    ('result = self.get_profile()', 'result = await self.get_profile()', False),
-    ('return self.search(', 'return await self.search(', False),
-
-    # ---- Return annotation -------------------------------------------
-    ("-> 'YandexBookClient':", "-> 'YandexBookClientAsync':", False),
-
-    # ---- Хедер файла -------------------------------------------------
-    (
-        '"""\nclient.py — синхронный клиент Яндекс Книги / Bookmate API.',
-        (
-            '"""\nclient_async.py — АСИНХРОННЫЙ клиент Яндекс Книги / Bookmate API.\n\n'
-            'Автоматически сгенерирован из client.py скриптом generate_async_version.py.\n'
-            'НЕ редактируйте этот файл вручную — изменения будут перезаписаны.'
-        ),
-        False,
-    ),
-]
+REQUEST_ASYNC_METHODS = {'get', 'post', 'delete', 'graphql', 'retrieve', 'download', 'close'}
+REQUEST_SYNC_METHODS = {'set_token', 'set_language'}
+DUNDER_NAMES = {'__enter__': '__aenter__', '__exit__': '__aexit__'}
 
 
-def apply_replacements(source: str, replacements: list) -> str:
-    for item in replacements:
-        old, new = item[0], item[1]
-        is_regex = item[2] if len(item) > 2 else False
-        if is_regex:
-            source = re.sub(old, new, source, flags=re.MULTILINE)
-        else:
-            source = source.replace(old, new)
-    return source
+class AsyncClientTransformer(ast.NodeTransformer):
+    def __init__(self, methods):
+        self.methods = methods
+        self.in_client = False
+        self.in_async = False
+
+    def visit_ImportFrom(self, node):
+        if node.module == 'yandex_book.utils.request':
+            node.module = 'yandex_book.utils.request_async'
+            node.names = [ast.alias(name='RequestAsync', asname='Request')]
+        return node
+
+    def visit_ClassDef(self, node):
+        previous = self.in_client
+        self.in_client = node.name == 'YandexBookClient'
+        if self.in_client:
+            node.name = 'YandexBookClientAsync'
+            if (node.body and isinstance(node.body[0], ast.Expr)
+                    and isinstance(node.body[0].value, ast.Constant)
+                    and isinstance(node.body[0].value.value, str)):
+                node.body[0].value.value = node.body[0].value.value.replace(
+                    'Синхронный клиент', 'Асинхронный клиент')
+        node = self.generic_visit(node)
+        self.in_client = previous
+        return node
+
+    def visit_FunctionDef(self, node):
+        make_async = (self.in_client and node.name in self.methods) or node.name == 'wrapper'
+        previous = self.in_async
+        self.in_async = make_async
+        node = self.generic_visit(node)
+        self.in_async = previous
+        if make_async:
+            node.name = DUNDER_NAMES.get(node.name, node.name)
+            node = ast.AsyncFunctionDef(**{field: getattr(node, field) for field in node._fields})
+        return node
+
+    def visit_AnnAssign(self, node):
+        if self.in_client and isinstance(node.target, ast.Name) and node.target.id == '_is_async':
+            node.value = ast.Constant(True)
+        return self.generic_visit(node)
+
+    def visit_Constant(self, node):
+        if node.value == 'YandexBookClient':
+            node.value = 'YandexBookClientAsync'
+        return node
+
+    def visit_Call(self, node):
+        node = self.generic_visit(node)
+        if not self.in_async:
+            return node
+        func = node.func
+        awaited = isinstance(func, ast.Name) and func.id == 'method'
+        if isinstance(func, ast.Attribute):
+            owner = func.value
+            if isinstance(owner, ast.Name) and owner.id == 'self':
+                awaited = func.attr in self.methods
+            elif (isinstance(owner, ast.Attribute) and owner.attr == '_request'
+                  and isinstance(owner.value, ast.Name) and owner.value.id == 'self'):
+                if func.attr not in REQUEST_ASYNC_METHODS | REQUEST_SYNC_METHODS:
+                    raise ValueError(f'Неизвестный метод HTTP-слоя: {func.attr}')
+                awaited = func.attr in REQUEST_ASYNC_METHODS
+        return ast.Await(value=node) if awaited else node
+
+
+def render_async(source: str) -> str:
+    tree = ast.parse(source)
+    if ast.get_docstring(tree):
+        tree.body[0].value.value = (
+            'Асинхронный клиент Яндекс Книг / Bookmate API.\n\n'
+            'Сгенерирован из client.py командой python generate_async_version.py.\n'
+            'Изменения вносите в исходный синхронный клиент.'
+        )
+    client = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                  and node.name == 'YandexBookClient')
+    methods = {node.name for node in client.body if isinstance(node, ast.FunctionDef)
+               and (not node.name.startswith('__') or node.name in DUNDER_NAMES)}
+    tree = AsyncClientTransformer(methods).visit(tree)
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree) + '\n'
 
 
 def generate_client_async() -> None:
-    if not CLIENT_SRC.exists():
-        print(f'Ошибка: {CLIENT_SRC} не найден', file=sys.stderr)
-        sys.exit(1)
-
-    source = CLIENT_SRC.read_text(encoding='utf-8')
-    result = apply_replacements(source, REPLACEMENTS_CLIENT)
-
-    warning = (
-        '# ============================================================\n'
-        '# ВНИМАНИЕ: этот файл сгенерирован автоматически.\n'
-        '# Источник: yandex_book/client.py\n'
-        '# Команда:  python generate_async_version.py\n'
-        '# ============================================================\n\n'
-    )
-    result = warning + result
-
-    CLIENT_DST.write_text(result, encoding='utf-8')
+    CLIENT_DST.write_text(render_async(CLIENT_SRC.read_text(encoding='utf-8')), encoding='utf-8')
     print(f'Создан: {CLIENT_DST}')
 
 
 if __name__ == '__main__':
     generate_client_async()
-    print('Готово.')

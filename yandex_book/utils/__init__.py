@@ -8,7 +8,7 @@ import dataclasses
 from typing import Type, TypeVar
 
 try:
-    from typing import dataclass_transform  # Python 3.12+
+    from typing import dataclass_transform  # Python 3.11+
 except ImportError:
     from typing_extensions import dataclass_transform  # type: ignore[no-redef]
 

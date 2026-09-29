@@ -13,10 +13,12 @@ from dataclasses import field
 from typing import TYPE_CHECKING, Any, List, Optional
 
 from yandex_book.base import BaseModel
+from yandex_book.exceptions import InvalidOptionError
 from yandex_book.utils import model
 
 if TYPE_CHECKING:
     from yandex_book.client import YandexBookClient
+    from yandex_book.book.book import Book
 
 
 # ---------------------------------------------------------------------------
@@ -84,14 +86,16 @@ class Person(BaseModel):
         cls_data['avatar'] = Image.de_json(data.get('avatar'), client)
         return cls(client=client, **cls_data)
 
-    def fetch_books(self) -> list:
+    def fetch_books(self, role: str = 'author', page: int = 1, per_page: int = 20) -> List['Book']:
         """Получить книги автора через клиент."""
-        assert self.valid_client(self.client), 'Требуется синхронный клиент'
-        return self.client.get_person_books(self.uuid)  # type: ignore[union-attr]
+        self.require_client()
+        self.require_id(self.uuid)
+        return self.client.get_person_books(self.uuid, role=role, page=page, per_page=per_page)
 
-    async def fetch_books_async(self) -> list:
-        assert self.valid_async_client(self.client), 'Требуется асинхронный клиент'
-        return await self.client.get_person_books(self.uuid)  # type: ignore[union-attr]
+    async def fetch_books_async(self, role: str = 'author', page: int = 1, per_page: int = 20) -> List['Book']:
+        self.require_client(asynchronous=True)
+        self.require_id(self.uuid)
+        return await self.client.get_person_books(self.uuid, role=role, page=page, per_page=per_page)
 
 
 # ---------------------------------------------------------------------------
@@ -149,59 +153,74 @@ class User(BaseModel):
         Returns:
             Путь к сохранённому файлу.
         """
-        assert self.valid_client(self.client), 'Требуется синхронный клиент'
-        assert self.avatar is not None, 'Аватар недоступен'
+        self.require_client()
+        if not (self.avatar is not None):
+            raise InvalidOptionError('Аватар недоступен')
+        if size not in ('small', 'large'):
+            raise InvalidOptionError('Размер аватара должен быть small или large')
         url = getattr(self.avatar, size, None) or self.avatar.best_url
-        assert url, f'URL аватара размера {size!r} не найден'
+        if not (url):
+            raise InvalidOptionError(f'URL аватара размера {size!r} не найден')
+        if not dest:
+            self.require_id(self.uuid or self.id)
         dest = dest or f'avatars/{self.uuid or self.id}_{size}.jpg'
         import os
         os.makedirs(os.path.dirname(dest), exist_ok=True) if os.path.dirname(dest) else None
-        self.client._request.download(url, dest)  # type: ignore[union-attr]
+        self.client.download_file(url, dest)  # type: ignore[union-attr]
         return dest
 
     # ---- Shortcut-методы на клиент ----------------------------------- #
 
     def fetch_books(self):
         """Получить книги пользователя."""
-        assert self.valid_client(self.client), 'Требуется синхронный клиент'
-        return self.client.get_user_books(self.uuid or self.id)  # type: ignore[union-attr]
+        self.require_client()
+        self.require_id(self.login or self.id)
+        return self.client.get_user_books(self.login or self.id)  # type: ignore[union-attr]
 
     def fetch_audiobooks(self):
         """Получить аудиокниги пользователя."""
-        assert self.valid_client(self.client), 'Требуется синхронный клиент'
-        return self.client.get_user_audiobooks(self.uuid or self.id)  # type: ignore[union-attr]
+        self.require_client()
+        self.require_id(self.login or self.id)
+        return self.client.get_user_audiobooks(self.login or self.id)  # type: ignore[union-attr]
 
     def fetch_bookshelves(self):
         """Получить полки пользователя."""
-        assert self.valid_client(self.client), 'Требуется синхронный клиент'
-        return self.client.get_user_bookshelves(self.uuid or self.id)  # type: ignore[union-attr]
+        self.require_client()
+        self.require_id(self.login or self.id)
+        return self.client.get_user_bookshelves(self.login or self.id)  # type: ignore[union-attr]
 
     def fetch_quotes(self):
         """Получить цитаты пользователя."""
-        assert self.valid_client(self.client), 'Требуется синхронный клиент'
-        return self.client.get_user_quotes(self.uuid or self.id)  # type: ignore[union-attr]
+        self.require_client()
+        self.require_id(self.login or self.id)
+        return self.client.get_user_quotes(self.login or self.id)  # type: ignore[union-attr]
 
     def fetch_impressions(self):
         """Получить рецензии пользователя."""
-        assert self.valid_client(self.client), 'Требуется синхронный клиент'
-        return self.client.get_user_impressions(self.uuid or self.id)  # type: ignore[union-attr]
+        self.require_client()
+        self.require_id(self.login or self.id)
+        return self.client.get_user_impressions(self.login or self.id)  # type: ignore[union-attr]
 
     def fetch_followings(self):
         """Получить подписки пользователя."""
-        assert self.valid_client(self.client), 'Требуется синхронный клиент'
-        return self.client.get_user_followings(self.uuid or self.id)  # type: ignore[union-attr]
+        self.require_client()
+        self.require_id(self.login or self.id)
+        return self.client.get_user_followings(self.login or self.id)  # type: ignore[union-attr]
 
     def fetch_reading_achievements(self):
         """Получить достижения пользователя."""
-        assert self.valid_client(self.client), 'Требуется синхронный клиент'
-        return self.client.get_user_reading_achievements(self.uuid or self.id)  # type: ignore[union-attr]
+        self.require_client()
+        self.require_id(self.login or self.id)
+        return self.client.get_user_reading_achievements(self.login or self.id)  # type: ignore[union-attr]
 
     # ---- Async shortcuts --------------------------------------------- #
 
     async def fetch_books_async(self):
-        assert self.valid_async_client(self.client), 'Требуется асинхронный клиент'
-        return await self.client.get_user_books(self.uuid or self.id)  # type: ignore[union-attr]
+        self.require_client(asynchronous=True)
+        self.require_id(self.login or self.id)
+        return await self.client.get_user_books(self.login or self.id)  # type: ignore[union-attr]
 
     async def fetch_audiobooks_async(self):
-        assert self.valid_async_client(self.client), 'Требуется асинхронный клиент'
-        return await self.client.get_user_audiobooks(self.uuid or self.id)  # type: ignore[union-attr]
+        self.require_client(asynchronous=True)
+        self.require_id(self.login or self.id)
+        return await self.client.get_user_audiobooks(self.login or self.id)  # type: ignore[union-attr]

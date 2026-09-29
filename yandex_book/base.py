@@ -19,6 +19,8 @@ import dataclasses
 import json
 import logging
 from typing import Any, Dict, List, Optional, Type, TypeVar
+from yandex_book.utils.json import PYTHON_RESERVED
+from yandex_book.exceptions import IdMissingError, InvalidOptionError
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +28,6 @@ JSONType = Dict[str, Any]
 
 # Ключевые слова Python, которые нельзя использовать как имена полей.
 # При нормализации ключей JSON добавляется _ в конец.
-PYTHON_RESERVED = frozenset({
-    'type', 'from', 'import', 'class', 'return', 'pass',
-    'in', 'is', 'format', 'filter', 'id', 'input', 'list',
-    'dict', 'set', 'max', 'min', 'sum', 'map', 'zip',
-})
 
 Self = TypeVar('Self', bound='BaseModel')
 
@@ -52,6 +49,8 @@ def _recursive_to_dict(value: Any, for_request: bool) -> Any:
 
 def _snake_to_camel(name: str) -> str:
     """snake_case → camelCase. Пример: book_uuid → bookUuid."""
+    if name.endswith('_') and name[:-1] in PYTHON_RESERVED:
+        name = name[:-1]
     parts = name.split('_')
     return parts[0] + ''.join(p.title() for p in parts[1:])
 
@@ -72,6 +71,17 @@ class BaseObject:
     def valid_async_client(client: Any) -> bool:
         """Проверяет, что client — это асинхронный клиент."""
         return client is not None and getattr(client, '_is_async', False)
+
+    def require_client(self, asynchronous: bool = False) -> None:
+        check = self.valid_async_client if asynchronous else self.valid_client
+        if not check(self.client):
+            mode = 'асинхронный' if asynchronous else 'синхронный'
+            raise InvalidOptionError(f'Требуется {mode} клиент')
+
+    @staticmethod
+    def require_id(value: Any) -> None:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            raise IdMissingError('Идентификатор отсутствует')
 
 
 # ---------------------------------------------------------------------------
@@ -104,12 +114,8 @@ class BaseModel(BaseObject):
 
     @classmethod
     def is_array_model_data(cls, data: Any) -> bool:
-        """Возвращает True если data — непустой список dict-ов."""
-        return (
-            isinstance(data, list)
-            and bool(data)
-            and isinstance(data[0], dict)
-        )
+        """Возвращает True если data — непустой список."""
+        return isinstance(data, list) and bool(data)
 
     # ------------------------------------------------------------------ #
     # Фильтрация данных                                                    #
@@ -198,11 +204,20 @@ class BaseModel(BaseObject):
     # ------------------------------------------------------------------ #
 
     def __eq__(self, other: Any) -> bool:
-        if isinstance(other, self.__class__):
-            return self._id_attrs == other._id_attrs
-        return False
+        if type(self) is not type(other):
+            return NotImplemented
+        if self is other:
+            return True
+        if not self._has_identity() or not other._has_identity():
+            return False
+        return self._id_attrs == other._id_attrs
+
+    def _has_identity(self) -> bool:
+        return bool(self._id_attrs) and all(value is not None and value != '' for value in self._id_attrs)
 
     def __hash__(self) -> int:
+        if not self._has_identity():
+            return object.__hash__(self)
         frozen = tuple(
             frozenset(a) if isinstance(a, list) else a
             for a in self._id_attrs

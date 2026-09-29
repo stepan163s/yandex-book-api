@@ -6,7 +6,8 @@ ApiError                      # базовое
 ├── BadRequestError           # 400 — неверный запрос
 ├── NotFoundError             # 404 — ресурс не найден
 ├── NetworkError              # сетевые ошибки
-│   └── TimedOutError         # таймаут
+│   ├── TimedOutError         # таймаут
+│   └── EndpointGoneError     # HTTP 410 — эндпоинт больше недоступен
 ├── InvalidOptionError        # недопустимое значение параметра
 └── IdMissingError            # обязательный ID отсутствует
 """
@@ -22,6 +23,10 @@ class NetworkError(ApiError):
 
 class TimedOutError(NetworkError):
     """Запрос превысил время ожидания."""
+
+
+class EndpointGoneError(NetworkError):
+    """HTTP 410: эндпоинт больше недоступен на стороне сервиса."""
 
 
 class UnauthorizedError(ApiError):

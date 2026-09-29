@@ -14,37 +14,21 @@ utils/request.py — синхронный HTTP-слой.
 """
 from __future__ import annotations
 
-import json
-import re
+from contextlib import contextmanager
 from typing import Any, Dict, Optional
 
 import requests
 
 from yandex_book.exceptions import (
-    BadRequestError,
     NetworkError,
-    NotFoundError,
     TimedOutError,
-    UnauthorizedError,
 )
 
 JSONType = Dict[str, Any]
 
-# Ключевые слова Python, конфликтующие с именами полей.
-# При нормализации JSON-ключей добавляем _ в конец.
-_RESERVED = frozenset({
-    'type', 'from', 'import', 'class', 'return', 'pass',
-    'in', 'is', 'format', 'filter', 'id', 'input', 'list',
-    'dict', 'set', 'max', 'min', 'sum', 'map', 'zip',
-})
-
-# Regex для преобразования camelCase → snake_case.
-# Пример: bookUuid → book_uuid, listenerCount → listener_count
-_CAMEL_RE = re.compile(r'(?<=[a-z0-9])([A-Z])')
-
-
-def _camel_to_snake(name: str) -> str:
-    return _CAMEL_RE.sub(r'_\1', name).lower()
+from yandex_book.utils.json import extract_error, normalize_keys, parse_json, raise_for_status
+from yandex_book.utils.download import atomic_download, redirect_request, safe_headers
+from requests.structures import CaseInsensitiveDict
 
 
 class Request:
@@ -73,6 +57,8 @@ class Request:
     def __init__(self, client: Any, timeout: int = 10) -> None:
         self._client = client
         self._timeout = timeout
+        self._closed = False
+        self._token = None
         self._session = requests.Session()
         self._session.headers.update(self.BASE_HEADERS)
 
@@ -82,7 +68,7 @@ class Request:
 
     def set_token(self, token: str) -> None:
         """Устанавливает Auth-Token для всех последующих запросов."""
-        self._session.headers['Auth-Token'] = token
+        self._token = token
 
     def set_language(self, language: str) -> None:
         """Устанавливает App-Language / App-Locale."""
@@ -135,86 +121,60 @@ class Request:
         """
         return self._request_wrapper('GET', url, **kwargs)
 
+    def close(self) -> None:
+        self._session.close()
+        self._closed = True
+
     def download(self, url: str, filepath: str, **kwargs) -> None:
-        """Скачивает файл по URL и сохраняет в filepath."""
-        content = self.retrieve(url, stream=True, **kwargs)
-        with open(filepath, 'wb') as f:
-            f.write(content)
+        kwargs['stream'] = True
+        with atomic_download(filepath) as temporary:
+            with self._response('GET', url, **kwargs) as response:
+                with open(temporary, 'wb') as file:
+                    for chunk in response.iter_content(chunk_size=65536):
+                        if chunk:
+                            file.write(chunk)
 
-    # ------------------------------------------------------------------ #
-    # Внутренние методы                                                    #
-    # ------------------------------------------------------------------ #
-
-    def _request_wrapper(self, method: str, url: str, **kwargs) -> bytes:
-        """Единая точка выполнения HTTP-запроса и обработки ошибок."""
+    @contextmanager
+    def _response(self, method: str, url: str, **kwargs):
+        if self._closed:
+            raise RuntimeError('HTTP-клиент уже закрыт')
         kwargs.setdefault('timeout', self._timeout)
-
-        # Merge extra headers without overwriting session headers.
         extra = kwargs.pop('headers', {})
-        if extra:
-            merged = dict(self._session.headers)
-            merged.update(extra)
-            kwargs['headers'] = merged
-
+        headers = CaseInsensitiveDict(self._session.headers)
+        if self._token:
+            headers['Auth-Token'] = self._token
+        headers.update(extra)
+        allow_redirects = kwargs.pop('allow_redirects', True)
+        response = None
         try:
-            resp = self._session.request(method, url, **kwargs)
+            for attempt in range(11):
+                headers = safe_headers(self._client, url, headers)
+                response = self._session.request(method, url, headers=headers, allow_redirects=False, **kwargs)
+                if (allow_redirects and response.status_code in (301, 302, 303, 307, 308)
+                        and response.headers.get('Location')):
+                    if attempt == 10:
+                        raise NetworkError('Слишком много HTTP-перенаправлений')
+                    url, method, headers = redirect_request(
+                        response.status_code, method, url, response.headers['Location'], kwargs, headers)
+                    response.close()
+                    response = None
+                    continue
+                if not 200 <= response.status_code <= 299:
+                    raise_for_status(response.status_code, response.content)
+                yield response
+                return
         except requests.Timeout as exc:
             raise TimedOutError(f'Запрос превысил таймаут ({self._timeout}с)') from exc
-        except requests.ConnectionError as exc:
-            raise NetworkError(f'Ошибка соединения: {exc}') from exc
         except requests.RequestException as exc:
             raise NetworkError(str(exc)) from exc
+        finally:
+            if response is not None:
+                response.close()
 
-        if not (200 <= resp.status_code <= 299):
-            message = self._extract_error(resp.content)
-            if resp.status_code in (401, 403):
-                raise UnauthorizedError(message)
-            if resp.status_code == 400:
-                raise BadRequestError(message)
-            if resp.status_code == 404:
-                raise NotFoundError(message)
-            raise NetworkError(f'HTTP {resp.status_code}: {message}')
+    def _request_wrapper(self, method: str, url: str, **kwargs) -> bytes:
+        with self._response(method, url, **kwargs) as response:
+            return response.content
 
-        return resp.content
-
-    def _extract_error(self, content: bytes) -> str:
-        """Извлекает сообщение об ошибке из тела ответа."""
-        try:
-            data = json.loads(content)
-            return (
-                data.get('message')
-                or data.get('error')
-                or data.get('errors', [{}])[0].get('message', '')
-                or 'Unknown error'
-            )
-        except Exception:
-            return content.decode('utf-8', errors='replace') or 'Unknown error'
-
-    def _parse(self, content: bytes) -> JSONType:
-        """JSON-парсинг с нормализацией ключей за один проход."""
-        if not content:
-            return {}
-        return json.loads(content, object_hook=self._normalize_keys)
-
-    @staticmethod
-    def _normalize_keys(obj: dict) -> dict:
-        """Нормализует ключи JSON во время парсинга.
-
-        Преобразования (в порядке):
-          1. kebab-case → snake_case  (book-uuid → book_uuid)
-          2. camelCase  → snake_case  (bookUuid  → book_uuid)
-          3. lower()                  (LANG → lang)
-          4. reserved → reserved_    (type → type_)
-          5. _0field   → _0field     (0field → _0field, если начинается с цифры)
-        """
-        result: dict = {}
-        for key, value in obj.items():
-            key = key.replace('-', '_')
-            key = _camel_to_snake(key)
-            key = key.lower()
-            if key in _RESERVED:
-                key += '_'
-            if key and key[0].isdigit():
-                key = '_' + key
-            result[key] = value
-        return result
+    _extract_error = staticmethod(extract_error)
+    _parse = staticmethod(parse_json)
+    _normalize_keys = staticmethod(normalize_keys)
